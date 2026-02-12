@@ -1,10 +1,6 @@
-void* GetExport(char* base, const char* name) {
+void* GetExportAddress(char* base, const char* targetName) {
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
     PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
-    
-    // Safety check for empty export table
-    if (nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size == 0) return NULL;
-
     PIMAGE_EXPORT_DIRECTORY exports = (PIMAGE_EXPORT_DIRECTORY)(base + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
     
     DWORD* names = (DWORD*)(base + exports->AddressOfNames);
@@ -12,18 +8,23 @@ void* GetExport(char* base, const char* name) {
     WORD* ordinals = (WORD*)(base + exports->AddressOfNameOrdinals);
 
     for (DWORD i = 0; i < exports->NumberOfNames; i++) {
-        char* funcName = (char*)(base + names[i]);
+        char* currentName = (char*)(base + names[i]);
         
-        // Manual string comparison loop (Relocation-safe)
-        const char* s1 = funcName;
-        const char* s2 = name;
-        while (*s1 && (*s1 == *s2)) {
+        /* Manual String Compare */
+        const char* s1 = currentName;
+        const char* s2 = targetName;
+        int match = 1;
+        
+        while (*s1 && *s2) {
+            if (*s1 != *s2) {
+                match = 0;
+                break;
+            }
             s1++;
             s2++;
         }
-
-        if (*(unsigned char*)s1 == *(unsigned char*)s2) {
-            return (void*)(base + functions[ordinals[i]]);
+        if (match && *s1 == *s2) { /* Ensure both ended at null terminator */
+             return (void*)(base + functions[ordinals[i]]);
         }
     }
     return NULL;
