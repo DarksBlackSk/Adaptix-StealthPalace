@@ -2,14 +2,24 @@
 #include "loader.h"
 #include "tcg.h"
 
+#define NtCurrentProcess()  ((HANDLE)(LONG_PTR)-1)
+
 DECLSPEC_IMPORT LPVOID WINAPI KERNEL32$VirtualAlloc ( LPVOID, SIZE_T, DWORD, DWORD );
 DECLSPEC_IMPORT BOOL WINAPI KERNEL32$VirtualProtect ( LPVOID, SIZE_T, DWORD, PDWORD );
 DECLSPEC_IMPORT BOOL WINAPI KERNEL32$VirtualFree ( LPVOID, SIZE_T, DWORD );
 DECLSPEC_IMPORT BOOL WINAPI KERNEL32$FlushInstructionCache(HANDLE, LPCVOID, SIZE_T);
 // MessageBoxA is used in the hooks to demonstrate that the hooks are working, and to show the output of the GetVersions callback
 DECLSPEC_IMPORT int WINAPI USER32$MessageBoxA ( HWND, LPCSTR, LPCSTR, UINT );
+DECLSPEC_IMPORT HANDLE  KERNEL32$CreateThread(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
+DECLSPEC_IMPORT BOOL    KERNEL32$CloseHandle(HANDLE);
+DECLSPEC_IMPORT HANDLE  KERNEL32$CreateTimerQueue(VOID);
+DECLSPEC_IMPORT BOOL    KERNEL32$CreateTimerQueueTimer(PHANDLE, HANDLE, WAITORTIMERCALLBACK, PVOID, DWORD, DWORD, ULONG);
+DECLSPEC_IMPORT BOOL    KERNEL32$DeleteTimerQueue(HANDLE);
+DECLSPEC_IMPORT HANDLE  KERNEL32$CreateEventA(LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCSTR);
+DECLSPEC_IMPORT BOOL    KERNEL32$SetEvent(HANDLE);
 // GetLastError from kernel32.dll for error handling
 DECLSPEC_IMPORT DWORD WINAPI KERNEL32$GetLastError ( void );
+DECLSPEC_IMPORT DWORD WINAPI KERNEL32$WaitForSingleObject(HANDLE, DWORD);
 
 // Printf from msvcrt.dll
 DECLSPEC_IMPORT int __cdecl MSVCRT$printf ( const char *, ... );
@@ -29,6 +39,15 @@ typedef struct {
     int  len;
     char value[];
 } RESOURCE;
+
+typedef struct {
+	char * picData;
+	DWORD  picSize;
+} PIC_CLEANUP_CTX;
+typedef struct {
+    void (*fn)(void);
+    HANDLE evt;
+} TIMER_CTX;
 
 int __tag_setup_hooks ( );
 int __tag_set_image_info ( );
@@ -96,6 +115,20 @@ void fix_section_permissions ( DLLDATA * dll, char * dst )
         /* advance to section */
         section_hdr++;
     }
+}
+
+/* Top-level timer callback used to invoke function pointers and signal an event. */
+VOID CALLBACK Loader_TimerInvoke(PVOID lpParam, BOOLEAN TimerOrWaitFired)
+{
+    typedef struct { void (*fn)(void); HANDLE evt; } TIMER_CTX;
+    TIMER_CTX *ctx = (TIMER_CTX *)lpParam;
+    if (!ctx) return;
+
+    if (ctx->fn) ctx->fn();
+    if (ctx->evt) KERNEL32$SetEvent(ctx->evt);
+
+    /* free our context */
+    KERNEL32$VirtualFree(ctx, 0, MEM_RELEASE);
 }
 
 void go(void)
@@ -188,5 +221,36 @@ void go(void)
     _GetVersions pGetVersions = (_GetVersions)GetExport(dll_dst, targetFunc);
 
     if (pGetVersions)
-        pGetVersions();
+    {
+        MSVCRT$printf ( "[loader] invoking GetVersions() via CreateTimerQueueTimer...\n" );
+
+        HANDLE hTimerQueue = KERNEL32$CreateTimerQueue();
+        HANDLE hTimer = NULL;
+        HANDLE hEvt = KERNEL32$CreateEventA(NULL, TRUE, FALSE, NULL);
+
+        TIMER_CTX * ctx = (TIMER_CTX *)KERNEL32$VirtualAlloc(NULL, sizeof(TIMER_CTX), MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+        if (ctx && hTimerQueue && hEvt) {
+            ctx->fn = pGetVersions;
+            ctx->evt = hEvt;
+
+            /* Create a timer that will call our loader timer invoke. */
+            if (KERNEL32$CreateTimerQueueTimer(&hTimer, hTimerQueue, (WAITORTIMERCALLBACK)Loader_TimerInvoke, ctx, 0, 0, WT_EXECUTEONLYONCE)) {
+                MSVCRT$printf("[loader] waiting for timer to invoke GetVersions()...\n");
+                KERNEL32$WaitForSingleObject(hEvt, 500);
+                MSVCRT$printf("[loader] timer invocation finished\n");
+            } else {
+                MSVCRT$printf("[loader] CreateTimerQueueTimer failed\n");
+                KERNEL32$VirtualFree(ctx, 0, MEM_RELEASE);
+            }
+
+            KERNEL32$DeleteTimerQueue(hTimerQueue);
+            KERNEL32$CloseHandle(hEvt);
+        } else {
+            MSVCRT$printf("[loader] failed to create timer queue/event or allocate ctx\n");
+            if (ctx) KERNEL32$VirtualFree(ctx, 0, MEM_RELEASE);
+            if (hTimerQueue) KERNEL32$DeleteTimerQueue(hTimerQueue);
+            if (hEvt) KERNEL32$CloseHandle(hEvt);
+        }
+
+    }
 }

