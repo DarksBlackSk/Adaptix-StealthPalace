@@ -119,6 +119,7 @@ func compileCoff(root string) {
 	}{
 		{filepath.Join(srcDir, "pico.c"), filepath.Join(buildDir, "pico.x64.o")},
 		{filepath.Join(srcDir, "loader.c"), filepath.Join(buildDir, "loader.x64.o")},
+		{filepath.Join(srcDir, "stomp.c"), filepath.Join(buildDir, "stomp.x64.o")},
 		{filepath.Join(srcDir, "services.c"), filepath.Join(buildDir, "services.x64.o")},
 		{filepath.Join(srcDir, "hooks.c"), filepath.Join(buildDir, "hooks.x64.o")},
 	}

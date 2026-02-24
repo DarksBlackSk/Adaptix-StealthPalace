@@ -1,3 +1,4 @@
+#pragma once
 /*
  * Copyright 2025 Raphael Mudge, Adversary Fan Fiction Writers Guild
  *

@@ -40,8 +40,6 @@ static void restore_section_permissions(void)
             prot = PAGE_EXECUTE_READWRITE;
         if ((c & IMAGE_SCN_MEM_EXECUTE) && (c & IMAGE_SCN_MEM_READ))
             prot = PAGE_EXECUTE_READ;
-        if ((c & IMAGE_SCN_MEM_READ) && (c & IMAGE_SCN_MEM_WRITE) && (c & IMAGE_SCN_MEM_EXECUTE))
-            prot = PAGE_EXECUTE_READWRITE;
 
         if (prot != 0 && size > 0)
             KERNEL32$VirtualProtect(addr, size, prot, &old_prot);
