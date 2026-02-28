@@ -101,3 +101,20 @@ DWORD SizeOfDLL(DLLDATA * data);
 #pragma intrinsic(_ReturnAddress)
 #define WIN_GET_CALLER() _ReturnAddress()
 #endif
+
+/*
+ * Debug printing for DEBUG builds, no-op for RELEASE builds
+ */
+#ifdef DEBUG
+DECLSPEC_IMPORT int __cdecl MSVCRT$printf ( const char *, ... );
+#define __FILENAME__ (__builtin_strrchr(__FILE__, '\\') ? \
+                      __builtin_strrchr(__FILE__, '\\') + 1 : \
+                      (__builtin_strrchr(__FILE__, '/') ? \
+                       __builtin_strrchr(__FILE__, '/') + 1 : __FILE__))
+#define StealthDbg( x, ... ) {  \
+    MSVCRT$printf(   \
+        ( "[StealthPalace::%s::%s::%d] => " x ), __FILENAME__ ,__FUNCTION__, __LINE__, ##__VA_ARGS__ );  \
+    }
+#else
+#define StealthDbg( x, ... )
+#endif

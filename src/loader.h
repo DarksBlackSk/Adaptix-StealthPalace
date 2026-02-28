@@ -25,7 +25,6 @@ DECLSPEC_IMPORT DWORD WINAPI KERNEL32$WaitForSingleObject(HANDLE, DWORD);
 DECLSPEC_IMPORT HMODULE WINAPI KERNEL32$LoadLibraryExA(LPCSTR, HANDLE, DWORD);
 
 // Printf from msvcrt.dll
-DECLSPEC_IMPORT int __cdecl MSVCRT$printf ( const char *, ... );
 DECLSPEC_IMPORT void * __cdecl MSVCRT$memset ( void *, int, size_t );
 DECLSPEC_IMPORT void * __cdecl MSVCRT$memcpy ( void *, const void *, size_t );
 
@@ -59,16 +58,27 @@ typedef void (WINAPI* _GetVersions)();
 
 int __tag_setup_hooks ( );
 int __tag_set_image_info ( );
-int __tag_Stomp( );
 
 typedef void ( * SETUP_HOOKS ) ( IMPORTFUNCS * funcs );
 typedef void ( * SET_IMAGE_INFO ) ( PVOID base, DWORD size );
 
 #define GETRESOURCE(x) ( char * ) &x
 
-// Stomp DLL DEFINES
-#define PICO_STOMP_DLL "mshtml.dll"
-#define DLL_STOMP_DLL "Chakra.dll"
+#ifdef STOMP_DLL
+
+    #ifndef PICO_STOMP_DLL
+        #error "PICO_STOMP_DLL must be defined when compiling StompDLL"
+    #endif
+
+    #ifndef DLL_STOMP_DLL
+        #error "DLL_STOMP_DLL must be defined when compiling StompDLL"
+    #endif
+
+    #define MODE_STOMP 1
+
+#else
+    #define MODE_STOMP 0
+#endif
 
 void* GetExport(char* base, const char* name) {
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;

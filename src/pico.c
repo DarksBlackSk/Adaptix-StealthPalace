@@ -1,8 +1,6 @@
 #include <windows.h>
 #include "tcg.h"
 
-DECLSPEC_IMPORT int __cdecl MSVCRT$printf(const char *, ...);
-
 /* globals defined in hooks.c — shared via merge in the same PICO */
 extern PVOID  g_ImageBase;
 extern DWORD  g_ImageSize;
@@ -20,7 +18,7 @@ FARPROC WINAPI _GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
     if ((ULONG_PTR)lpProcName > 0xFFFF) {
         FARPROC hook = __resolve_hook(ror13hash(lpProcName));
         if (hook) {
-            MSVCRT$printf("[hook] Hooked import: %s\n", lpProcName);
+            StealthDbg("Hooked import: %s\n", lpProcName);
             return hook;
         }
     }
@@ -45,5 +43,5 @@ void set_image_info ( PVOID base, DWORD size )
 {
     g_ImageBase = base;
     g_ImageSize = size;
-    MSVCRT$printf("[pico] set_image_info: base=%p size=0x%lx\n", base, size);
+    StealthDbg("set_image_info: base=%p size=0x%lx\n", base, size);
 }

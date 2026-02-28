@@ -470,7 +470,6 @@ DECLSPEC_IMPORT BOOL    KERNEL32$SetThreadContext(HANDLE, const CONTEXT *);
 DECLSPEC_IMPORT BOOL    KERNEL32$CloseHandle(HANDLE);
 DECLSPEC_IMPORT VOID    KERNEL32$SetLastError(DWORD);
 
-DECLSPEC_IMPORT int __cdecl MSVCRT$printf(const char *, ...);
 DECLSPEC_IMPORT void * __cdecl MSVCRT$memcpy(void *, const void *, size_t);
 DECLSPEC_IMPORT void * __cdecl MSVCRT$memset(void *, int, size_t);
 
